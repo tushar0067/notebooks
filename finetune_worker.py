@@ -2,10 +2,22 @@ import os
 import shutil
 import requests
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from ultralytics import YOLO
 
 app = FastAPI(title="YOLOv8 Fine-Tuning Worker")
+
+# ------------------------------------------------------------------------------
+# 1. Add CORS Middleware to enable OPTIONS preflight requests
+# ------------------------------------------------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins (or specify your app domain: e.g. ["http://localhost:5173"])
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows GET, POST, OPTIONS, etc.
+    allow_headers=["*"],  # Allows all headers (Authorization, Content-Type, etc.)
+)
 
 # Replace with your production Supabase URL
 SUPABASE_URL = "https://base.wiserly.org"
