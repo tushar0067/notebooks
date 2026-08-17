@@ -1,5 +1,6 @@
 import os
 import shutil
+import zipfile
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +23,7 @@ SUPABASE_URL = "https://base.wiserly.org"
 class FineTuneRequest(BaseModel):
     session_token: str
     model_id: str  # this is the model_name in the private_model table
+    project_id: str  # which project's annotated dataset to train on
     epochs: int = 30
 
 
@@ -58,6 +60,44 @@ def fetch_user_base_model(session_token: str, model_name: str) -> str:
     return local_path
 
 
+def fetch_dataset(session_token: str, project_id: str) -> str:
+    """
+    Calls finetune-export-dataset to get a zipped YOLO dataset (images/, labels/,
+    data.yaml with the project's real classes). Extracts it to /content/dataset
+    and returns the path to data.yaml.
+    """
+    res = requests.post(
+        f"{SUPABASE_URL}/functions/v1/finetune-export-dataset",
+        json={"session_token": session_token, "project_id": project_id},
+    )
+
+    if res.status_code != 200:
+        try:
+            detail = res.json().get("error", res.text)
+        except Exception:
+            detail = res.text
+        raise Exception(f"Failed to export dataset: {detail}")
+
+    dataset_dir = "/content/dataset"
+    if os.path.exists(dataset_dir):
+        shutil.rmtree(dataset_dir)
+    os.makedirs(dataset_dir, exist_ok=True)
+
+    zip_path = "/content/dataset.zip"
+    with open(zip_path, "wb") as f:
+        f.write(res.content)
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(dataset_dir)
+    os.remove(zip_path)
+
+    data_yaml_path = os.path.join(dataset_dir, "data.yaml")
+    if not os.path.exists(data_yaml_path):
+        raise Exception("data.yaml missing from exported dataset")
+
+    return data_yaml_path
+
+
 @app.post("/start-finetune")
 def start_finetune(req: FineTuneRequest):
     # 1. Verify single-use token with Supabase Edge Function
@@ -79,15 +119,20 @@ def start_finetune(req: FineTuneRequest):
         base_weights_path = fetch_user_base_model(req.session_token, model_id)
         print(f"✅ Base model ready at {base_weights_path}")
 
-        # 3. Run Fine-Tuning on GPU, starting from the user's own weights
+        # 3. Pull the project's real annotated dataset (replaces coco8.yaml)
+        print(f"📦 Exporting dataset for project '{req.project_id}'...")
+        data_yaml_path = fetch_dataset(req.session_token, req.project_id)
+        print(f"✅ Dataset ready at {data_yaml_path}")
+
+        # 4. Run Fine-Tuning on GPU, starting from the user's own weights and real data
         model = YOLO(base_weights_path)
-        results = model.train(data="coco8.yaml", epochs=req.epochs, imgsz=640)
+        results = model.train(data=data_yaml_path, epochs=req.epochs, imgsz=640)
 
         weights_path = os.path.join(results.save_dir, "weights", "best.pt")
         if not os.path.exists(weights_path):
             raise Exception("Weights file not found after training completed.")
 
-        # 4. Upload completed weights back via Edge Function
+        # 5. Upload completed weights back via Edge Function
         with open(weights_path, "rb") as f:
             weights_bytes = f.read()
         complete_res = requests.post(
