@@ -2,7 +2,7 @@ import os
 import shutil
 import zipfile
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from ultralytics import YOLO
@@ -98,20 +98,9 @@ def fetch_dataset(session_token: str, project_id: str) -> str:
     return data_yaml_path
 
 
-@app.post("/start-finetune")
-def start_finetune(req: FineTuneRequest):
-    # 1. Verify single-use token with Supabase Edge Function
-    verify_res = requests.post(
-        f"{SUPABASE_URL}/functions/v1/verify-finetune-session",
-        json={"session_token": req.session_token}
-    )
-
-    if verify_res.status_code != 200:
-        raise HTTPException(status_code=401, detail="Invalid or expired session token")
-    session_data = verify_res.json()
-    model_id = session_data.get("model_id", req.model_id)
-    print(f"🚀 Token verified! Starting YOLOv8 training for model: {model_id}...")
-
+def run_finetune_job(req: "FineTuneRequest", model_id: str):
+    """The actual training work — runs in a background thread so the HTTP
+    response can return immediately and the Cloudflare tunnel never times out."""
     base_weights_path = None
     try:
         # 2. Pull + decrypt the user's own base model instead of a fixed public one
@@ -147,11 +136,38 @@ def start_finetune(req: FineTuneRequest):
         if os.path.exists(results.save_dir):
             shutil.rmtree(results.save_dir)
 
-        return {"status": "success", "message": "Fine-tuning completed and weights saved successfully!"}
+        print("✅ Fine-tuning completed and weights saved successfully!")
     except Exception as e:
+        # Can't raise HTTPException here — this runs after the response was
+        # already sent. Just log loudly; the frontend already got its "started" ack.
         print(f"❌ Error during training execution: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
     finally:
         # Always scrub the decrypted base weights off Colab's disk
         if base_weights_path and os.path.exists(base_weights_path):
             os.remove(base_weights_path)
+
+
+@app.post("/start-finetune")
+def start_finetune(req: FineTuneRequest, background_tasks: BackgroundTasks):
+    # 1. Verify single-use token with Supabase Edge Function
+    verify_res = requests.post(
+        f"{SUPABASE_URL}/functions/v1/verify-finetune-session",
+        json={"session_token": req.session_token}
+    )
+
+    if verify_res.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid or expired session token")
+    session_data = verify_res.json()
+    model_id = session_data.get("model_id", req.model_id)
+    print(f"🚀 Token verified! Starting YOLOv8 training for model: {model_id}...")
+
+    # 2. Kick off the actual training in the background and respond immediately —
+    #    training can run for minutes and the Cloudflare tunnel will 524 long
+    #    before that if we make the caller wait for it.
+    background_tasks.add_task(run_finetune_job, req, model_id)
+
+    return {
+        "status": "started",
+        "message": "Training dispatched. Weights will be uploaded automatically when it finishes.",
+        "model_id": model_id,
+    }
