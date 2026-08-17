@@ -98,10 +98,22 @@ def fetch_dataset(session_token: str, project_id: str) -> str:
     return data_yaml_path
 
 
+def update_status(session_token: str, status: str, error_message: str = None):
+    """Best-effort status ping — never let a status-update failure kill training."""
+    try:
+        payload = {"session_token": session_token, "status": status}
+        if error_message:
+            payload["error_message"] = error_message[:500]
+        requests.post(f"{SUPABASE_URL}/functions/v1/finetune-update-status", json=payload, timeout=10)
+    except Exception as e:
+        print(f"⚠️ Failed to update status: {e}")
+
+
 def run_finetune_job(req: "FineTuneRequest", model_id: str):
     """The actual training work — runs in a background thread so the HTTP
     response can return immediately and the Cloudflare tunnel never times out."""
     base_weights_path = None
+    update_status(req.session_token, "training")
     try:
         # 2. Pull + decrypt the user's own base model instead of a fixed public one
         print(f"🔐 Fetching and decrypting base model '{model_id}' for training...")
@@ -137,10 +149,10 @@ def run_finetune_job(req: "FineTuneRequest", model_id: str):
             shutil.rmtree(results.save_dir)
 
         print("✅ Fine-tuning completed and weights saved successfully!")
+        # NOTE: status flips to "completed" inside complete-finetune-session itself
     except Exception as e:
-        # Can't raise HTTPException here — this runs after the response was
-        # already sent. Just log loudly; the frontend already got its "started" ack.
         print(f"❌ Error during training execution: {str(e)}")
+        update_status(req.session_token, "failed", str(e))
     finally:
         # Always scrub the decrypted base weights off Colab's disk
         if base_weights_path and os.path.exists(base_weights_path):
