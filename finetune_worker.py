@@ -49,7 +49,6 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
 )
 
 SUPABASE_URL = "https://base.wiserly.org"
@@ -113,10 +112,13 @@ def health():
     return {"status": "ok", "worker": "YOLO Fine-Tuner"}
 
 
-def update_status(session_token: str, status: str, error_message: str = None):
-    """Best-effort status ping — never let a status-update failure kill training."""
+def update_status(session_token: str, status: str, error_message: str = None, **extra):
+    """Best-effort status ping — never let a status-update failure kill training.
+    extra can carry project_id/model_id/mode/base_architecture/parent_model/
+    epochs/hyperparameters/metrics, which finetune-update-status persists
+    into the training_runs history table."""
     try:
-        payload = {"session_token": session_token, "status": status}
+        payload = {"session_token": session_token, "status": status, **extra}
         if error_message:
             payload["error_message"] = error_message[:500]
         requests.post(f"{SUPABASE_URL}/functions/v1/finetune-update-status", json=payload, timeout=10)
@@ -201,7 +203,13 @@ def run_finetune_job(req: "FineTuneRequest", model_id: str):
     new weights over the old model."""
     base_weights_path = None
     is_downloaded_base = False  # only delete it after if WE fetched+decrypted it
-    update_status(req.session_token, "training")
+    update_status(
+        req.session_token, "training",
+        project_id=req.project_id, model_id=model_id, mode=req.mode,
+        base_architecture=req.base_architecture if req.mode == "new" else None,
+        parent_model=model_id if req.mode == "finetune" else None,
+        epochs=req.epochs,
+    )
     try:
         base_weights_path = resolve_base_weights(req, model_id)
         is_downloaded_base = req.mode != "new"  # stock .pt files are cached by ultralytics, not ours to delete
@@ -269,7 +277,11 @@ def run_finetune_job(req: "FineTuneRequest", model_id: str):
         print("👉 Happy with these results? Run Cell 3 to upload the new weights.")
         print("   Not happy? Just re-run Cell 2 with different settings — nothing was uploaded.")
 
-        update_status(req.session_token, "review")
+        update_status(
+            req.session_token, "review",
+            hyperparameters={k: v for k, v in train_kwargs.items() if k != "data"},
+            metrics=metrics,
+        )
     except Exception as e:
         print(f"❌ Error during training execution: {str(e)}")
         update_status(req.session_token, "failed", str(e))
