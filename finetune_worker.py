@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import shutil
 import zipfile
@@ -8,6 +9,27 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from ultralytics import YOLO
+
+# --- Mirror all stdout (including Ultralytics' own training logs) to a file.
+# Colab's live cell output isn't reliable for background-thread prints once
+# the launching cell shows as "finished" — this file is the reliable source
+# of truth for progress, checkable from any new cell at any time. ---
+LOG_FILE_PATH = "/content/worker.log"
+
+class _Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+            s.flush()
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+_log_file = open(LOG_FILE_PATH, "a", buffering=1)
+sys.stdout = _Tee(sys.stdout, _log_file)
+sys.stderr = _Tee(sys.stderr, _log_file)
 
 app = FastAPI(title="YOLOv8 Fine-Tuning Worker")
 
@@ -22,12 +44,26 @@ app.add_middleware(
 SUPABASE_URL = "https://base.wiserly.org"
 LAST_RUN_PATH = "/content/last_run.json"
 
+# Stock architectures Ultralytics can auto-download when starting a brand new model.
+ALLOWED_BASE_ARCHITECTURES = {
+    "yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x",
+    "yolov9t", "yolov9s", "yolov9m", "yolov9c", "yolov9e",
+    "yolo11n", "yolo11s", "yolo11m", "yolo11l", "yolo11x",
+}
+
 
 class FineTuneRequest(BaseModel):
     session_token: str
-    model_id: str          # model_name in private_model table
+    model_id: str          # model_name in private_model table (finetune) OR the new model's name (new)
     project_id: str        # which project's annotated dataset to train on
     epochs: int = 30
+
+    # --- Mode: "finetune" uses the user's own private model as the base
+    # (decrypted via finetune-fetch-model). "new" starts from a stock
+    # pretrained Ultralytics architecture instead — no decrypt step needed,
+    # Ultralytics auto-downloads the .pt on first use. ---
+    mode: str = "finetune"                        # "finetune" | "new"
+    base_architecture: Optional[str] = None        # e.g. "yolov8n" — required when mode="new"
 
     # --- Real hyperparameters, all optional. Omit any of these from the
     # request and Ultralytics' own default is used — nothing is silently
@@ -97,6 +133,27 @@ def fetch_user_base_model(session_token: str, model_name: str) -> str:
     return local_path
 
 
+def resolve_base_weights(req: "FineTuneRequest", model_id: str) -> str:
+    """Returns a local path (or a stock architecture name Ultralytics will
+    auto-download) to use as the starting weights for training."""
+    if req.mode == "new":
+        arch = (req.base_architecture or "").strip().lower()
+        if arch not in ALLOWED_BASE_ARCHITECTURES:
+            raise Exception(
+                f"Invalid or missing base_architecture '{arch}' for mode='new'. "
+                f"Must be one of: {sorted(ALLOWED_BASE_ARCHITECTURES)}"
+            )
+        print(f"🆕 Starting a NEW model '{model_id}' from stock architecture '{arch}'...")
+        # Ultralytics auto-downloads this from its own release CDN on first use —
+        # no decrypt/fetch step needed since there's no existing private model.
+        return f"{arch}.pt"
+    else:
+        print(f"🔐 Fetching and decrypting base model '{model_id}' for fine-tuning...")
+        path = fetch_user_base_model(req.session_token, model_id)
+        print(f"✅ Base model ready at {path}")
+        return path
+
+
 def fetch_dataset(session_token: str, project_id: str) -> str:
     res = requests.post(
         f"{SUPABASE_URL}/functions/v1/finetune-export-dataset",
@@ -132,11 +189,11 @@ def run_finetune_job(req: "FineTuneRequest", model_id: str):
     explicit step (Cell 3) so you can review metrics before committing the
     new weights over the old model."""
     base_weights_path = None
+    is_downloaded_base = False  # only delete it after if WE fetched+decrypted it
     update_status(req.session_token, "training")
     try:
-        print(f"🔐 Fetching and decrypting base model '{model_id}' for training...")
-        base_weights_path = fetch_user_base_model(req.session_token, model_id)
-        print(f"✅ Base model ready at {base_weights_path}")
+        base_weights_path = resolve_base_weights(req, model_id)
+        is_downloaded_base = req.mode != "new"  # stock .pt files are cached by ultralytics, not ours to delete
 
         print(f"📦 Exporting dataset for project '{req.project_id}'...")
         data_yaml_path = fetch_dataset(req.session_token, req.project_id)
@@ -189,6 +246,7 @@ def run_finetune_job(req: "FineTuneRequest", model_id: str):
             json.dump({
                 "session_token": req.session_token,
                 "model_id": model_id,
+                "mode": req.mode,
                 "weights_path": weights_path,
                 "metrics": metrics,
                 "epochs": req.epochs,
@@ -205,12 +263,14 @@ def run_finetune_job(req: "FineTuneRequest", model_id: str):
         print(f"❌ Error during training execution: {str(e)}")
         update_status(req.session_token, "failed", str(e))
     finally:
-        if base_weights_path and os.path.exists(base_weights_path):
+        if is_downloaded_base and base_weights_path and os.path.exists(base_weights_path):
             os.remove(base_weights_path)
 
 
 @app.post("/start-finetune")
 def start_finetune(req: FineTuneRequest, background_tasks: BackgroundTasks):
+    # Always verify the token, regardless of mode — this is what proves the
+    # request is legitimately authenticated, not the model's existence.
     verify_res = requests.post(
         f"{SUPABASE_URL}/functions/v1/verify-finetune-session",
         json={"session_token": req.session_token}
@@ -218,8 +278,13 @@ def start_finetune(req: FineTuneRequest, background_tasks: BackgroundTasks):
     if verify_res.status_code != 200:
         raise HTTPException(status_code=401, detail="Invalid or expired session token")
     session_data = verify_res.json()
-    model_id = session_data.get("model_id", req.model_id)
-    print(f"🚀 Token verified! Starting YOLOv8 training for model: {model_id}...")
+
+    if req.mode == "new":
+        model_id = req.model_id  # new model name — nothing to look up yet
+        print(f"🚀 Token verified! Starting NEW model training: '{model_id}' from '{req.base_architecture}'...")
+    else:
+        model_id = session_data.get("model_id", req.model_id)
+        print(f"🚀 Token verified! Starting YOLOv8 fine-tuning for model: {model_id}...")
 
     background_tasks.add_task(run_finetune_job, req, model_id)
 
@@ -227,4 +292,5 @@ def start_finetune(req: FineTuneRequest, background_tasks: BackgroundTasks):
         "status": "started",
         "message": "Training dispatched. Check Colab logs for progress and review results before uploading.",
         "model_id": model_id,
+        "mode": req.mode,
     }
