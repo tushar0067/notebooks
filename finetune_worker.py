@@ -26,6 +26,16 @@ class _Tee:
     def flush(self):
         for s in self.streams:
             s.flush()
+    def isatty(self):
+        # uvicorn's log formatter checks this during setup to decide on
+        # colored output — delegate to the real terminal stream (the first
+        # one, which is the original sys.stdout/stderr we wrapped).
+        return self.streams[0].isatty() if hasattr(self.streams[0], "isatty") else False
+    def fileno(self):
+        return self.streams[0].fileno()
+    @property
+    def encoding(self):
+        return getattr(self.streams[0], "encoding", "utf-8")
 
 _log_file = open(LOG_FILE_PATH, "a", buffering=1)
 sys.stdout = _Tee(sys.stdout, _log_file)
