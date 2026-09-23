@@ -66,6 +66,7 @@ class FineTuneRequest(BaseModel):
     session_token: str
     model_id: str          # model_name in private_model table (finetune) OR the new model's name (new)
     project_id: str        # which project's annotated dataset to train on
+    version_tag: Optional[str] = None  # frozen DatasetVersioning tag, e.g. "v1" — omit/"v0" for live staging
     epochs: int = 30
 
     # --- Mode: "finetune" uses the user's own private model as the base
@@ -167,10 +168,13 @@ def resolve_base_weights(req: "FineTuneRequest", model_id: str) -> str:
         return path
 
 
-def fetch_dataset(session_token: str, project_id: str) -> str:
+def fetch_dataset(session_token: str, project_id: str, version_tag: Optional[str] = None) -> str:
+    payload = {"session_token": session_token, "project_id": project_id}
+    if version_tag:
+        payload["version_tag"] = version_tag
     res = requests.post(
         f"{SUPABASE_URL}/functions/v1/finetune-export-dataset",
-        json={"session_token": session_token, "project_id": project_id},
+        json=payload,
     )
     if res.status_code != 200:
         try:
@@ -208,14 +212,14 @@ def run_finetune_job(req: "FineTuneRequest", model_id: str):
         project_id=req.project_id, model_id=model_id, mode=req.mode,
         base_architecture=req.base_architecture if req.mode == "new" else None,
         parent_model=model_id if req.mode == "finetune" else None,
-        epochs=req.epochs,
+        epochs=req.epochs, dataset_version=req.version_tag or "v0",
     )
     try:
         base_weights_path = resolve_base_weights(req, model_id)
         is_downloaded_base = req.mode != "new"  # stock .pt files are cached by ultralytics, not ours to delete
 
         print(f"📦 Exporting dataset for project '{req.project_id}'...")
-        data_yaml_path = fetch_dataset(req.session_token, req.project_id)
+        data_yaml_path = fetch_dataset(req.session_token, req.project_id, req.version_tag)
         print(f"✅ Dataset ready at {data_yaml_path}")
 
         # Build train() kwargs — only include hyperparams that were actually set,
