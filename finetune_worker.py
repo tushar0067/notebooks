@@ -10,7 +10,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from ultralytics import YOLO
 
-# --- Mirror all stdout (including Ultralytics' own training logs) to a file. ---
+# --- Mirror all stdout (including Ultralytics' own training logs) to a file.
+# Colab's live cell output isn't reliable for background-thread prints once
+# the launching cell shows as "finished" — this file is the reliable source
+# of truth for progress, checkable from any new cell at any time. ---
 LOG_FILE_PATH = "/content/worker.log"
 
 class _Tee:
@@ -24,6 +27,9 @@ class _Tee:
         for s in self.streams:
             s.flush()
     def isatty(self):
+        # uvicorn's log formatter checks this during setup to decide on
+        # colored output — delegate to the real terminal stream (the first
+        # one, which is the original sys.stdout/stderr we wrapped).
         return self.streams[0].isatty() if hasattr(self.streams[0], "isatty") else False
     def fileno(self):
         return self.streams[0].fileno()
@@ -58,14 +64,24 @@ ALLOWED_BASE_ARCHITECTURES = {
 
 class FineTuneRequest(BaseModel):
     session_token: str
-    model_id: str
-    project_id: str
+    model_id: str          # model_name in private_model table (finetune) OR the new model's name (new)
+    project_id: str        # which project's annotated dataset to train on
+    version_tag: Optional[str] = None  # frozen DatasetVersioning tag, e.g. "v1" — omit/"v0" for live staging
     epochs: int = 30
-    mode: str = "finetune"
-    base_architecture: Optional[str] = None
+
+    # --- Mode: "finetune" uses the user's own private model as the base
+    # (decrypted via finetune-fetch-model). "new" starts from a stock
+    # pretrained Ultralytics architecture instead — no decrypt step needed,
+    # Ultralytics auto-downloads the .pt on first use. ---
+    mode: str = "finetune"                        # "finetune" | "new"
+    base_architecture: Optional[str] = None        # e.g. "yolov8n" — required when mode="new"
+
+    # --- Real hyperparameters, all optional. Omit any of these from the
+    # request and Ultralytics' own default is used — nothing is silently
+    # forced except epochs/imgsz/batch/optimizer as before. ---
     imgsz: int = 640
     batch: int = 16
-    optimizer: str = "auto"
+    optimizer: str = "auto"          # auto, SGD, Adam, AdamW, etc.
     lr0: Optional[float] = None
     lrf: Optional[float] = None
     momentum: Optional[float] = None
@@ -92,16 +108,16 @@ class FineTuneRequest(BaseModel):
     patience: Optional[int] = None
 
 
-class UploadRequest(BaseModel):
-    session_token: str
-
-
 @app.get("/health")
 def health():
     return {"status": "ok", "worker": "YOLO Fine-Tuner"}
 
 
 def update_status(session_token: str, status: str, error_message: str = None, **extra):
+    """Best-effort status ping — never let a status-update failure kill training.
+    extra can carry project_id/model_id/mode/base_architecture/parent_model/
+    epochs/hyperparameters/metrics, which finetune-update-status persists
+    into the training_runs history table."""
     try:
         payload = {"session_token": session_token, "status": status, **extra}
         if error_message:
@@ -131,7 +147,9 @@ def fetch_user_base_model(session_token: str, model_name: str) -> str:
     return local_path
 
 
-def resolve_base_weights(req: FineTuneRequest, model_id: str) -> str:
+def resolve_base_weights(req: "FineTuneRequest", model_id: str) -> str:
+    """Returns a local path (or a stock architecture name Ultralytics will
+    auto-download) to use as the starting weights for training."""
     if req.mode == "new":
         arch = (req.base_architecture or "").strip().lower()
         if arch not in ALLOWED_BASE_ARCHITECTURES:
@@ -140,6 +158,8 @@ def resolve_base_weights(req: FineTuneRequest, model_id: str) -> str:
                 f"Must be one of: {sorted(ALLOWED_BASE_ARCHITECTURES)}"
             )
         print(f"🆕 Starting a NEW model '{model_id}' from stock architecture '{arch}'...")
+        # Ultralytics auto-downloads this from its own release CDN on first use —
+        # no decrypt/fetch step needed since there's no existing private model.
         return f"{arch}.pt"
     else:
         print(f"🔐 Fetching and decrypting base model '{model_id}' for fine-tuning...")
@@ -148,10 +168,13 @@ def resolve_base_weights(req: FineTuneRequest, model_id: str) -> str:
         return path
 
 
-def fetch_dataset(session_token: str, project_id: str) -> str:
+def fetch_dataset(session_token: str, project_id: str, version_tag: Optional[str] = None) -> str:
+    payload = {"session_token": session_token, "project_id": project_id}
+    if version_tag:
+        payload["version_tag"] = version_tag
     res = requests.post(
         f"{SUPABASE_URL}/functions/v1/finetune-export-dataset",
-        json={"session_token": session_token, "project_id": project_id},
+        json=payload,
     )
     if res.status_code != 200:
         try:
@@ -178,24 +201,29 @@ def fetch_dataset(session_token: str, project_id: str) -> str:
     return data_yaml_path
 
 
-def run_finetune_job(req: FineTuneRequest, model_id: str):
+def run_finetune_job(req: "FineTuneRequest", model_id: str):
+    """Trains and saves results locally. Does NOT upload — that's a separate,
+    explicit step (Cell 3) so you can review metrics before committing the
+    new weights over the old model."""
     base_weights_path = None
-    is_downloaded_base = False
+    is_downloaded_base = False  # only delete it after if WE fetched+decrypted it
     update_status(
         req.session_token, "training",
         project_id=req.project_id, model_id=model_id, mode=req.mode,
         base_architecture=req.base_architecture if req.mode == "new" else None,
         parent_model=model_id if req.mode == "finetune" else None,
-        epochs=req.epochs,
+        epochs=req.epochs, dataset_version=req.version_tag or "v0",
     )
     try:
         base_weights_path = resolve_base_weights(req, model_id)
-        is_downloaded_base = req.mode != "new"
+        is_downloaded_base = req.mode != "new"  # stock .pt files are cached by ultralytics, not ours to delete
 
         print(f"📦 Exporting dataset for project '{req.project_id}'...")
-        data_yaml_path = fetch_dataset(req.session_token, req.project_id)
+        data_yaml_path = fetch_dataset(req.session_token, req.project_id, req.version_tag)
         print(f"✅ Dataset ready at {data_yaml_path}")
 
+        # Build train() kwargs — only include hyperparams that were actually set,
+        # so anything left as None falls through to Ultralytics' own default.
         train_kwargs = {
             "data": data_yaml_path,
             "epochs": req.epochs,
@@ -223,6 +251,7 @@ def run_finetune_job(req: FineTuneRequest, model_id: str):
         if not os.path.exists(weights_path):
             raise Exception("Weights file not found after training completed.")
 
+        # Pull final metrics for the review step
         metrics = {}
         try:
             rd = results.results_dict
@@ -235,6 +264,7 @@ def run_finetune_job(req: FineTuneRequest, model_id: str):
         except Exception:
             pass
 
+        # Write everything Cell 3 needs to upload, without re-running anything
         with open(LAST_RUN_PATH, "w") as f:
             json.dump({
                 "session_token": req.session_token,
@@ -248,7 +278,8 @@ def run_finetune_job(req: FineTuneRequest, model_id: str):
 
         print("✅ Training complete. Results saved for review.")
         print(f"📊 Metrics: {metrics}")
-        print("👉 You can now deploy these weights directly from your web app UI dashboard!")
+        print("👉 Happy with these results? Run Cell 3 to upload the new weights.")
+        print("   Not happy? Just re-run Cell 2 with different settings — nothing was uploaded.")
 
         update_status(
             req.session_token, "review",
@@ -265,6 +296,8 @@ def run_finetune_job(req: FineTuneRequest, model_id: str):
 
 @app.post("/start-finetune")
 def start_finetune(req: FineTuneRequest, background_tasks: BackgroundTasks):
+    # Always verify the token, regardless of mode — this is what proves the
+    # request is legitimately authenticated, not the model's existence.
     verify_res = requests.post(
         f"{SUPABASE_URL}/functions/v1/verify-finetune-session",
         json={"session_token": req.session_token}
@@ -274,7 +307,7 @@ def start_finetune(req: FineTuneRequest, background_tasks: BackgroundTasks):
     session_data = verify_res.json()
 
     if req.mode == "new":
-        model_id = req.model_id
+        model_id = req.model_id  # new model name — nothing to look up yet
         print(f"🚀 Token verified! Starting NEW model training: '{model_id}' from '{req.base_architecture}'...")
     else:
         model_id = session_data.get("model_id", req.model_id)
@@ -284,51 +317,7 @@ def start_finetune(req: FineTuneRequest, background_tasks: BackgroundTasks):
 
     return {
         "status": "started",
-        "message": "Training dispatched. Check Colab logs for progress and review results in your web dashboard.",
+        "message": "Training dispatched. Check Colab logs for progress and review results before uploading.",
         "model_id": model_id,
         "mode": req.mode,
     }
-
-
-@app.post("/upload-weights")
-def trigger_frontend_upload(req: UploadRequest):
-    """Secure endpoint invoked from the web dashboard UI to upload best.pt directly to Supabase."""
-    if not os.path.exists(LAST_RUN_PATH):
-        raise HTTPException(status_code=404, detail="No training run results found on worker.")
-    
-    with open(LAST_RUN_PATH, "r") as f:
-        run_data = json.load(f)
-    
-    if run_data.get("session_token") != req.session_token:
-        raise HTTPException(status_code=403, detail="Session token mismatch.")
-    
-    weights_path = run_data.get("weights_path")
-    if not weights_path or not os.path.exists(weights_path):
-        raise HTTPException(status_code=404, detail="Weights file 'best.pt' not found on disk.")
-    
-    model_id = run_data.get("model_id")
-    
-    print(f"📤 Uploading weights for model '{model_id}' to Supabase via worker proxy...")
-    
-    try:
-        with open(weights_path, "rb") as f:
-            weights_bytes = f.read()
-            
-        res = requests.post(
-            f"{SUPABASE_URL}/functions/v1/complete-finetune-session",
-            headers={"Authorization": f"Bearer {req.session_token}"},
-            files={"file": ("best.pt", weights_bytes, "application/octet-stream")},
-            data={"model_id": model_id},
-            timeout=60
-        )
-        
-        if res.status_code != 200:
-            raise Exception(f"Supabase rejected upload: {res.text}")
-            
-        print("✅ Weights successfully uploaded and model updated via frontend request!")
-        update_status(req.session_token, "completed")
-        
-        return {"status": "success", "message": "Model weights successfully deployed."}
-    except Exception as e:
-        print(f"❌ Upload failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
