@@ -108,6 +108,10 @@ class FineTuneRequest(BaseModel):
     patience: Optional[int] = None
 
 
+class UploadRequest(BaseModel):
+    session_token: str
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "worker": "YOLO Fine-Tuner"}
@@ -321,3 +325,76 @@ def start_finetune(req: FineTuneRequest, background_tasks: BackgroundTasks):
         "model_id": model_id,
         "mode": req.mode,
     }
+
+@app.post("/upload-weights")
+def upload_weights(req: UploadRequest):
+    """Upload the reviewed best.pt for the exact training session.
+
+    The browser never receives the weight file. The worker reads the locally
+    trained artifact and proxies it to the authenticated Supabase Edge
+    Function using the same single-use training session token.
+    """
+    if not req.session_token.strip():
+        raise HTTPException(status_code=400, detail="session_token is required")
+
+    if not os.path.isfile(LAST_RUN_PATH):
+        raise HTTPException(status_code=404, detail="No completed training run is staged for upload.")
+
+    try:
+        with open(LAST_RUN_PATH, "r") as f:
+            run_data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise HTTPException(status_code=500, detail=f"Invalid staged training metadata: {e}")
+
+    staged_token = run_data.get("session_token")
+    if not staged_token or staged_token != req.session_token:
+        raise HTTPException(status_code=403, detail="Training session does not match the staged weights.")
+
+    weights_path = run_data.get("weights_path")
+    if not weights_path or not os.path.isfile(weights_path):
+        raise HTTPException(status_code=404, detail="Reviewed weights artifact was not found on the worker.")
+
+    # Re-validate the single-use training token immediately before the upload.
+    # No Supabase service key is exposed to the browser or worker.
+    try:
+        verify_res = requests.post(
+            f"{SUPABASE_URL}/functions/v1/verify-finetune-session",
+            json={"session_token": req.session_token},
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Could not verify training session: {e}")
+
+    if verify_res.status_code != 200:
+        raise HTTPException(status_code=401, detail="Training session is invalid or expired.")
+
+    model_id = run_data.get("model_id")
+    if not model_id:
+        raise HTTPException(status_code=500, detail="Staged training metadata is missing model_id.")
+
+    try:
+        with open(weights_path, "rb") as weights_file:
+            response = requests.post(
+                f"{SUPABASE_URL}/functions/v1/complete-finetune-session",
+                headers={"Authorization": f"Bearer {req.session_token}"},
+                files={"file": ("best.pt", weights_file, "application/octet-stream")},
+                data={"model_id": model_id},
+                timeout=120,
+            )
+    except requests.RequestException as e:
+        print(f"Weight upload request failed: {e}")
+        raise HTTPException(status_code=502, detail="Unable to reach the model deployment service.")
+
+    if response.status_code != 200:
+        print(f"Supabase rejected weight upload ({response.status_code}): {response.text[:1000]}")
+        raise HTTPException(status_code=502, detail="Model deployment was rejected by the server.")
+
+    update_status(req.session_token, "completed")
+
+    try:
+        os.remove(LAST_RUN_PATH)
+    except OSError as e:
+        print(f"Could not clear staged run metadata: {e}")
+
+    print(f"Reviewed weights deployed successfully for model '{model_id}'.")
+    return {"status": "success", "message": "Model weights successfully deployed.", "model_id": model_id}
